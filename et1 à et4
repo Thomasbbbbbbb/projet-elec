@@ -1,0 +1,306 @@
+#include <Wire.h>
+#include <RTClib.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+#include <TimerOne.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define MAX_DEVICES 4
+#define CLK_PIN   13
+#define DATA_PIN  11
+#define CS_PIN    10
+#define LED_LIGNES 0
+#define LED_COLONNES 0
+
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+MD_MAX72XX mx = MD_MAX72XX(MD_MAX72XX::GENERIC_HW, CS_PIN, MAX_DEVICES);
+RTC_DS3231 rtc;
+volatile bool ledState = false;
+unsigned long tempsAppuiBouton = 0;
+bool boutonPresse = false;
+// Définition des pins pour le bouton et l'encodeur
+const int buttonPin = 2; // Bouton pour changer le mode
+const int encodeurPin = A0; // Pin pour l'encodeur
+const int buzzerpin = 9;
+
+// Variables pour le mode de réglage
+bool inSettingMode = false;
+int settingPart = 0; // 0: heures, 1: minutes
+int dernierevaleurencodeur = 0;
+
+// Variables globales pour le clignotement
+unsigned long lastBlinkTime = 0;
+const int blinkInterval = 500; // Intervalle de clignotement en millisecondes
+bool displayOn = true;
+
+unsigned long dernierTempsClic = 0;
+unsigned long intervalleDoubleClic = 250; // 250 millisecondes pour le double clic
+
+int heureReveil = 0;
+int minutesReveil = 0;
+bool reglageReveil = false;  // Vrai quand on est en mode réglage du réveil
+// Définition des fréquences des notes musicales
+#define NOTE_C4  262
+#define NOTE_D4  294
+#define NOTE_E4  330
+#define NOTE_F4  349
+#define NOTE_G4  392
+
+
+const int interruptPin = 2;
+volatile bool alarmeActive = false;
+unsigned long debutAlarme = 0; // Pour suivre le début de l'alarme
+
+int modeAffichageHeure = 0; // 0 pour le format 24h, 1 pour le format 12h
+int melody[] = {NOTE_C4, NOTE_G4, NOTE_F4, NOTE_E4, 0, NOTE_D4, NOTE_C4};
+int noteDurations[] = {4, 8, 8, 4, 4, 4, 4, 4}; // Durée de chaque note
+
+
+void toggleLed() {
+  ledState = !ledState;
+  mx.setPoint(LED_LIGNES, LED_COLONNES, ledState);
+  mx.update();
+}
+
+void playMelody() {
+  for (int thisNote = 0; thisNote < 8; thisNote++) {
+    int noteDuration = 1000 / noteDurations[thisNote];
+    tone(buzzerpin, melody[thisNote], noteDuration);
+
+    int pauseBetweenNotes = noteDuration * 1.30;
+    delay(pauseBetweenNotes);
+    noTone(buzzerpin);
+  }
+}
+
+
+void checkAlarm() {
+  DateTime now = rtc.now();
+  if (now.hour() == heureReveil && now.minute() == minutesReveil && !alarmeActive) {
+    alarmeActive = true;
+    debutAlarme = millis(); // Commencer le suivi du temps de l'alarme
+    playMelody();
+  } else if (alarmeActive) {
+    if (millis() - debutAlarme > 20000) { // 20 secondes se sont écoulées
+      noTone(buzzerpin); // Arrête la mélodie
+      alarmeActive = false; // Désactive l'alarme
+    } else if (millis() - debutAlarme > 10000) { // Plus de 10 secondes, mais moins de 20
+      playMelody(); // Continue de jouer la mélodie en boucle
+    }
+  }
+}
+
+void toggleAlarme() {
+  alarmeActive = !alarmeActive;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+
+  if (alarmeActive) {
+    display.println("Alarme active");
+  } else {
+    display.println("Alarme inactive");
+  }
+
+  display.display();
+}
+
+
+void setup() {
+  Serial.begin(9600);
+  mx.begin();
+  pinMode(buttonPin, INPUT);
+  pinMode(encodeurPin, INPUT);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  // Adresse I2C de l'OLED
+  display.display();
+  delay(2000);
+  pinMode(buzzerpin, OUTPUT);
+  display.clearDisplay();
+
+  if (!rtc.begin()) {
+    Serial.println("Impossible de trouver le module RTC");
+    while (1);
+  }
+
+  Timer1.initialize(1000000);
+  Timer1.attachInterrupt(toggleLed);
+  dernierevaleurencodeur = analogRead(encodeurPin);
+
+  pinMode(interruptPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(interruptPin), toggleAlarme, CHANGE);
+}
+
+
+void adjustTime(int delta) {
+  DateTime now = rtc.now();
+  switch (settingPart) {
+    case 1: // Réglage des heures
+      now = now + TimeSpan(delta * 3600);
+      break;
+    case 2: // Réglage des minutes
+      now = now + TimeSpan(delta * 60);
+      break;
+  }
+  rtc.adjust(now);
+}
+
+
+void displaySetting() {
+  DateTime now = rtc.now();
+  char buffer[9];
+  sprintf(buffer, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+
+  // Gérer le clignotement
+  unsigned long currentTime = millis();
+  if (currentTime - lastBlinkTime > blinkInterval) {
+    displayOn = !displayOn;
+    lastBlinkTime = currentTime;
+  }
+
+  mx.clear();
+  for (int i = 0; i < 8; i++) {
+    // Clignoter les heures ou les minutes en fonction du mode de réglage
+    if ((settingPart == 1 && i < 2) || (settingPart == 2 && i >= 3 && i < 5)) {
+      if (!displayOn) {
+        continue; // Ne pas afficher les caractères lorsqu'ils doivent clignoter
+      }
+    }
+    mx.setChar(i, buffer[i]);
+  }
+  mx.update();
+}
+
+
+void toggleTimeFormat() {
+  modeAffichageHeure = (modeAffichageHeure + 1) % 2;
+}
+
+
+  
+void displayTime() {
+  DateTime now = rtc.now();
+  char buffer[11]; // Augmenter la taille pour "AM" ou "PM"
+
+  if (modeAffichageHeure == 0) { // Format 24h
+    sprintf(buffer, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+  } else { // Format 12h
+    int hour12 = now.hour() % 12;
+    hour12 = hour12 ? hour12 : 12; // Convertir 0 -> 12
+    const char* ampm = now.hour() >= 12 ? "PM" : "AM";
+    sprintf(buffer, "%02d:%02d:%02d %s", hour12, now.minute(), now.second(), ampm);
+  }
+
+  mx.clear();
+  for (int i = 0; i < 8; i++) {
+    mx.setChar(i, buffer[i]);
+  }
+  mx.update();
+}
+
+
+void reglerReveil() {
+  int valeurencodeur = analogRead(encodeurPin);
+  if (settingPart == 0) { // Réglage des heures
+    heureReveil = map(valeurencodeur, 0, 1023, 0, 23);
+  } else { // Réglage des minutes
+    minutesReveil = map(valeurencodeur, 0, 1023, 0, 59);
+  }
+
+  // Basculer entre le réglage des heures et des minutes
+  if (digitalRead(buttonPin) == HIGH) {
+    settingPart = (settingPart + 1) % 2;
+  }
+}
+
+
+void afficherReveilSurOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+
+  // Afficher l'heure de réveil
+  display.print("Heure de reveil: ");
+  display.print(heureReveil);
+  display.print(":");
+  display.println(minutesReveil);
+
+  display.display();
+}
+
+
+
+
+void loop() {
+  DateTime now = rtc.now();
+  int etatBoutonActuel = digitalRead(buttonPin);
+
+  // Vérifier si le bouton est appuyé
+  if (etatBoutonActuel == HIGH && !boutonPresse) {
+    boutonPresse = true;
+    tempsAppuiBouton = millis();
+  }
+
+  // Vérifier si le bouton est relâché
+  if (etatBoutonActuel == LOW && boutonPresse) {
+    if ((millis() - tempsAppuiBouton) >= 2000) { // Appui long de 2 secondes
+      reglageReveil = true;
+      settingPart = 0; // Commencer le réglage par les heures
+    }
+    boutonPresse = false;
+  }
+
+ 
+  static int dernierEtatBouton = LOW;
+  unsigned long tempsActuel = millis();
+
+  // Gestion de l'état du bouton pour le double-clic
+  if (etatBoutonActuel == HIGH && dernierEtatBouton == LOW) {
+    if (tempsActuel - dernierTempsClic <= intervalleDoubleClic) {
+      // Double-clic détecté
+      toggleTimeFormat();
+    }
+    dernierTempsClic = tempsActuel;
+  }
+  dernierEtatBouton = etatBoutonActuel;
+
+  if (reglageReveil) {
+    reglerReveil();
+    afficherReveilSurOLED();
+  } else if (inSettingMode) {
+    int valeurencodeur = analogRead(encodeurPin);
+    if (valeurencodeur != dernierevaleurencodeur) {
+      adjustTime(valeurencodeur - dernierevaleurencodeur);
+      dernierevaleurencodeur = valeurencodeur;
+    }
+    displaySetting();
+  } else {
+    displayTime();
+  }
+
+
+  if (!alarmeActive) {
+    // Afficher l'heure normale ou d'autres informations
+    displayTime(); // Assurez-vous que cette fonction n'efface pas l'état de l'alarme
+  }
+}
+
+
+  
+
+
+  
+
+
+
+  
+
